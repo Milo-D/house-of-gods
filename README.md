@@ -7,6 +7,12 @@ Furthermore, only a single UAF (write-after-free) bug on a smallchunk/largechunk
 
 ***Note:*** I am still working on a detailed write-up/paper for this technique. It will be published as soon as possible.
 
+# Executing the POC
+
+```console
+./patch && ./exploit.py
+```
+
 # Important
 
 This is the second revision of House-of-Gods. The first one is currently private and will be set to public as soon as possible.
