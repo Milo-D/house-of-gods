@@ -11,7 +11,7 @@
 
 /* forward declarations */
 
-static uint64_t leak_libbase(void);
+static uint64_t leak_libc(void);
 static uint64_t leak_heapbase(void);
 
 static void repl_menu(void);
@@ -42,8 +42,8 @@ int main(void) {
 	setvbuf(stdout, NULL, 2, 0);
 	setvbuf(stdin,  NULL, 2, 0);
 
-	const uint64_t libbase = leak_libbase();
-	printf("libbase: 0x%"PRIx64"\n", libbase);
+	const uint64_t symbol = leak_libc();
+	printf("puts: 0x%"PRIx64"\n", symbol);
 
 	const uint64_t heapbase = leak_heapbase();
 	printf("heapbase: 0x%"PRIx64"\n\n", heapbase);
@@ -71,10 +71,10 @@ int main(void) {
 
 /* helpers */
 
-static uint64_t leak_libbase(void) {
+static uint64_t leak_libc(void) {
 
 	puts("\x00\xde\xad\xbe\xef");
-	return *((uint64_t*) 0x602028) - 0x6d4d0;
+	return *((uint64_t*) 0x602028);
 }
 
 static uint64_t leak_heapbase(void) {
