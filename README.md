@@ -1,6 +1,6 @@
 # House of Gods - Second Revision
 
-House-of-Gods is a new heap exploitation technique for an older version of the GNU C Library (glibc 2.26).
+House-of-Gods is a new heap exploitation technique for older versions of the GNU C Library (<= glibc 2.26).
 
 This technique hijacks the arena within only 9 allocations and drops a shell after a total of 11 allocations. 
 Furthermore, only a single UAF (write-after-free) bug on a smallchunk/largechunk is needed to initiate House-of-Gods.
