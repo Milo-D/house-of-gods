@@ -31,7 +31,7 @@
 <--[ 1. Abstract ]-->
 
 House of Gods is a heap exploitation technique developed for binaries 
-linked against the GNU C Library version <= 2.26 (no tcache). Although not the most
+linked against the GNU C Library version < 2.27. Although not the most
 recent version, it is, in my opinion, still a very interesting technique.
 
 This paper demonstrates how to hijack the arena with only 8 allocations and a single
@@ -43,13 +43,13 @@ The exploit was successfully tested against
     - glibc-2.23
     - glibc-2.24
     - glibc-2.25
-    - glibc-2.26 (compiled without tcache)
+    - glibc-2.26
 
 <--[ 2. Technical Requirements ]-->
 
 Following requirements are mandatory in order to launch the House of Gods technique
 
-    - glibc version <= 2.26 (2.26 only if compiled without tcache)
+    - glibc version < 2.27
     - atleast 10 allocations of arbitrary size
     - control over atleast 5 quadwords of a chunk's userdata
     - a single write-after-free bug on an unsorted-chunk
@@ -189,7 +189,7 @@ or chunksize > av->system_mem
 
 The second test is an implicit one. In order to safely pass the partial unlinking without segfaulting, 
 one needs to forge a bk pointer to an address within a write-able page. Also there is no need to control
-bck->fd, since we are exploiting glibc <= 2.26.
+bck->fd, since we are exploiting glibc < 2.27.
 
     /* remove from unsorted list */
     unsorted_chunks (av)->bk = bck;
@@ -869,8 +869,7 @@ House of Gods has its advantages but also certainly some disadvantages.
 
     Disadvantages:
 
-        - does not work with tcache
-        - does not target recent versions (only glibc <= 2.26) 
+        - does not target recent versions (only glibc < 2.27) 
         - probably overkill if a WAF bug on fastchunks exists
         - requires allocation of arbitrary chunksizes
 
