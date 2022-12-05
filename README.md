@@ -20,7 +20,13 @@ Furthermore, only a single WAF bug on an unsorted-chunk is needed in order to la
 
 Paper: https://github.com/Milo-D/house-of-gods/blob/master/rev2/HOUSE_OF_GODS.TXT
 
-## Executing the POC (for both revisions)
+## how2heap
+
+A how2heap tutorial of the second revision can be now found here https://github.com/shellphish/how2heap/blob/master/glibc_2.24/house_of_gods.c
+
+## Proof of Concept
+
+For both revision, type
 
 ```console
 ./patch && ./exploit.py
