@@ -24,6 +24,12 @@ Paper: https://github.com/Milo-D/house-of-gods/blob/master/rev2/HOUSE_OF_GODS.TX
 
 A how2heap tutorial of the second revision can be now found here https://github.com/shellphish/how2heap/blob/master/glibc_2.24/house_of_gods.c
 
+## glibc bug report
+
+The second revision takes advantage of inappropriate malloc behaviour, which is still present in the most
+recent version of glibc. Although a rather minor issue with low priority, the bug was filed
+here https://sourceware.org/bugzilla/show_bug.cgi?id=29709
+
 ## Proof of Concept
 
 For both revision, type
